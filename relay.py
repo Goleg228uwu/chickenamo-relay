@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import traceback
 
 import websockets
 
@@ -17,7 +18,7 @@ async def heartbeat(ws):
         pass
 
 
-async def handler(ws):
+async def handler(ws, path=None):
     pid = None
     room_name = None
     hb = asyncio.create_task(heartbeat(ws))
@@ -84,6 +85,8 @@ async def handler(ws):
 
     except websockets.ConnectionClosed:
         pass
+    except Exception:
+        traceback.print_exc()
     finally:
         hb.cancel()
         room = ROOMS.get(room_name) if room_name else None
@@ -100,7 +103,7 @@ async def handler(ws):
                 ROOMS.pop(room_name, None)
                 print("[-] Комната '%s' опустела и удалена" % room_name, flush=True)
             else:
-                print("[-] Игрок id=%d вышел из '%s', комната жива" % (pid, room_name), flush=True)
+                print("[-] id=%d вышел из '%s', комната жива" % (pid, room_name), flush=True)
 
 
 async def main():
