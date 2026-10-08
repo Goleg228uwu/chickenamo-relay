@@ -1,145 +1,113 @@
 import asyncio
 import json
 import os
+
 import websockets
 
-ROOMS = {}          # имя комнаты -> данные комнаты
-MAX_PLAYERS = 8     # максимум игроков в комнате
-MAX_NAME = 10       # максимум символов в имени комнаты
-HEARTBEAT = 20      # секунд между пингами (держит соединение живым)
+ROOMS = {}
+NEXT_ID = [0]
 
-async def send(ws, data):
-    """Отправить словарь одному клиенту."""
-    await ws.send(json.dumps(data, ensure_ascii=False))
-
-async def broadcast(room, data, skip=None):
-    """Отправить словарь всем в комнате, кроме skip."""
-    for ws in list(room["peers"].values()):
-        if ws is not skip:
-            try:
-                await send(ws, data)
-            except Exception:
-                pass
 
 async def heartbeat(ws):
-    """Пингует клиента, чтобы соединение не засыпало."""
     try:
         while True:
-            await asyncio.sleep(HEARTBEAT)
+            await asyncio.sleep(20)
             await ws.ping()
     except Exception:
         pass
 
-async def handler(ws, path=None):
-    room_name, pid = None, None
+
+async def handler(ws):
+    pid = None
+    room_name = None
     hb = asyncio.create_task(heartbeat(ws))
     try:
         async for raw in ws:
-            try:
-                msg = json.loads(raw)
-            except Exception:
-                continue
-            t = msg.get("t")
+            data = json.loads(raw)
+            t = data.get("t")
 
-            # --- Вход в комнату ---
             if room_name is None:
                 if t == "host":
-                    name = str(msg.get("room", "")).strip()[:MAX_NAME]
-                    if name == "" or name in ROOMS:
-                        await send(ws, {"t": "err", "code": "taken" if name in ROOMS else "badname"})
+                    name = str(data.get("room", ""))[:10]
+                    if name in ROOMS:
+                        await ws.send(json.dumps({"t": "err", "code": "taken"}))
                         await ws.close()
                         return
+                    NEXT_ID[0] += 1
+                    pid = NEXT_ID[0]
                     ROOMS[name] = {
-                        "peers": {1: ws},
-                        "nicks": {1: str(msg.get("nick", ""))[:12]},
-                        "next_id": 2,
-                        "snap": {},
+                        "peers": {pid: ws},
+                        "nicks": {pid: str(data.get("nick", ""))[:12]},
                     }
-                    room_name, pid = name, 1
-                    print(f"[+] Хост создал комнату '{name}' (id=1)")
-                    await send(ws, {
-                        "t": "welcome",
-                        "id": 1,
-                        "room": name,
-                        "players": dict(ROOMS[name]["nicks"]),
-                    })
-                elif t == "join":
-                    name = str(msg.get("room", "")).strip()
-                    room = ROOMS.get(name)
-                    if room is None:
-                        await send(ws, {"t": "err", "code": "not_found"})
-                        await ws.close()
-                        return
-                    if len(room["peers"]) >= MAX_PLAYERS:
-                        await send(ws, {"t": "err", "code": "full"})
-                        await ws.close()
-                        return
-                    pid = room["next_id"]
-                    room["next_id"] += 1
-                    room["peers"][pid] = ws
-                    room["nicks"][pid] = str(msg.get("nick", ""))[:12]
                     room_name = name
-                    print(f"[+] Игрок id={pid} зашёл в комнату '{name}'")
-                    await send(ws, {
-                        "t": "welcome",
-                        "id": pid,
-                        "room": name,
-                        "players": dict(room["nicks"]),
-                    })
-                    # Отправляем новичку последние позиции всех игроков
-                    for sid, snap in room["snap"].items():
-                        if sid != pid:
-                            try:
-                                await send(ws, snap)
-                            except Exception:
-                                pass
-                    await broadcast(room, {
-                        "t": "joined",
-                        "id": pid,
-                        "nick": room["nicks"][pid],
-                    }, skip=ws)
+                    await ws.send(json.dumps(
+                        {"t": "welcome", "id": pid, "room": name,
+                         "players": ROOMS[name]["nicks"]}))
+                    print("[+] Хост создал комнату '%s' (id=%d)" % (name, pid), flush=True)
+
+                elif t == "join":
+                    name = str(data.get("room", ""))[:10]
+                    if name not in ROOMS:
+                        await ws.send(json.dumps({"t": "err", "code": "not_found"}))
+                        await ws.close()
+                        return
+                    room = ROOMS[name]
+                    if len(room["peers"]) >= 8:
+                        await ws.send(json.dumps({"t": "err", "code": "full"}))
+                        await ws.close()
+                        return
+                    NEXT_ID[0] += 1
+                    pid = NEXT_ID[0]
+                    room["peers"][pid] = ws
+                    room["nicks"][pid] = str(data.get("nick", ""))[:12]
+                    room_name = name
+                    await ws.send(json.dumps(
+                        {"t": "welcome", "id": pid, "room": name,
+                         "players": room["nicks"]}))
+                    msg = json.dumps({"t": "joined", "id": pid,
+                                      "nick": room["nicks"][pid]})
+                    for other in room["peers"].values():
+                        if other is not ws:
+                            await other.send(msg)
+                    print("[+] Игрок зашёл в '%s' (id=%d)" % (name, pid), flush=True)
                 else:
                     await ws.close()
                     return
-
-            # --- Сообщения внутри комнаты ---
             else:
                 room = ROOMS.get(room_name)
                 if room is None:
+                    await ws.close()
                     return
-                # Запоминаем позиции для снимка мира
-                if msg.get("t") == "pos" and msg.get("id") == pid:
-                    room["snap"][pid] = msg
-                # Пересылаем сообщение всем остальным игрокам
-                for other in list(room["peers"].values()):
+                for other in room["peers"].values():
                     if other is not ws:
-                        try:
-                            await other.send(raw)
-                        except Exception:
-                            pass
+                        await other.send(raw)
+
     except websockets.ConnectionClosed:
         pass
     finally:
         hb.cancel()
-        if room_name is not None:
-            room = ROOMS.get(room_name)
-            if room:
-                room["peers"].pop(pid, None)
-                room["nicks"].pop(pid, None)
-                room["snap"].pop(pid, None)
-                if pid == 1:
-                    ROOMS.pop(room_name, None)
-                    print(f"[-] Комната '{room_name}' закрыта (хост вышел)")
-                    await broadcast(room, {"t": "closed"})
-                else:
-                    print(f"[-] Игрок id={pid} вышел из комнаты '{room_name}'")
-                    await broadcast(room, {"t": "left", "id": pid})
+        room = ROOMS.get(room_name) if room_name else None
+        if room is not None and pid in room["peers"]:
+            del room["peers"][pid]
+            room["nicks"].pop(pid, None)
+            left = json.dumps({"t": "left", "id": pid})
+            for other in list(room["peers"].values()):
+                try:
+                    await other.send(left)
+                except Exception:
+                    pass
+            if not room["peers"]:
+                ROOMS.pop(room_name, None)
+                print("[-] Комната '%s' опустела и удалена" % room_name, flush=True)
+            else:
+                print("[-] Игрок id=%d вышел из '%s', комната жива" % (pid, room_name), flush=True)
+
 
 async def main():
-    # Render даёт порт через переменную окружения PORT
-    port = int(os.environ.get("PORT", 8765))
-    async with websockets.serve(handler, "0.0.0.0", port, max_size=2**22):
-        print(f"Реле запущено на порту {port}")
+    port = int(os.environ.get("PORT", 8080))
+    async with websockets.serve(handler, "0.0.0.0", port, max_size=2 ** 22):
+        print("Реле запущено на порту %d" % port, flush=True)
         await asyncio.Future()
+
 
 asyncio.run(main())
