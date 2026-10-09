@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import traceback
 
 import websockets
 
@@ -9,22 +8,15 @@ ROOMS = {}
 NEXT_ID = [0]
 
 
-async def heartbeat(ws):
-    try:
-        while True:
-            await asyncio.sleep(20)
-            await ws.ping()
-    except Exception:
-        pass
-
-
 async def handler(ws, path=None):
     pid = None
     room_name = None
-    hb = asyncio.create_task(heartbeat(ws))
     try:
         async for raw in ws:
-            data = json.loads(raw)
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
             t = data.get("t")
 
             if room_name is None:
@@ -36,16 +28,10 @@ async def handler(ws, path=None):
                         return
                     NEXT_ID[0] += 1
                     pid = NEXT_ID[0]
-                    ROOMS[name] = {
-                        "peers": {pid: ws},
-                        "nicks": {pid: str(data.get("nick", ""))[:12]},
-                    }
+                    ROOMS[name] = {"peers": {pid: ws}, "nicks": {pid: str(data.get("nick", ""))[:12]}}
                     room_name = name
-                    await ws.send(json.dumps(
-                        {"t": "welcome", "id": pid, "room": name,
-                         "players": ROOMS[name]["nicks"]}))
-                    print("[+] Хост создал комнату '%s' (id=%d)" % (name, pid), flush=True)
-
+                    await ws.send(json.dumps({"t": "welcome", "id": pid, "room": name, "players": ROOMS[name]["nicks"]}))
+                    print("[+] host '%s' id=%d" % (name, pid), flush=True)
                 elif t == "join":
                     name = str(data.get("room", ""))[:10]
                     if name not in ROOMS:
@@ -62,15 +48,12 @@ async def handler(ws, path=None):
                     room["peers"][pid] = ws
                     room["nicks"][pid] = str(data.get("nick", ""))[:12]
                     room_name = name
-                    await ws.send(json.dumps(
-                        {"t": "welcome", "id": pid, "room": name,
-                         "players": room["nicks"]}))
-                    msg = json.dumps({"t": "joined", "id": pid,
-                                      "nick": room["nicks"][pid]})
-                    for other in room["peers"].values():
+                    await ws.send(json.dumps({"t": "welcome", "id": pid, "room": name, "players": room["nicks"]}))
+                    msg = json.dumps({"t": "joined", "id": pid, "nick": room["nicks"][pid]})
+                    for other in list(room["peers"].values()):
                         if other is not ws:
                             await other.send(msg)
-                    print("[+] Игрок зашёл в '%s' (id=%d)" % (name, pid), flush=True)
+                    print("[+] join '%s' id=%d" % (name, pid), flush=True)
                 else:
                     await ws.close()
                     return
@@ -79,16 +62,18 @@ async def handler(ws, path=None):
                 if room is None:
                     await ws.close()
                     return
-                for other in room["peers"].values():
+                for other in list(room["peers"].values()):
                     if other is not ws:
-                        await other.send(raw)
+                        try:
+                            await other.send(raw)
+                        except Exception:
+                            pass
 
     except websockets.ConnectionClosed:
         pass
-    except Exception:
-        traceback.print_exc()
+    except Exception as e:
+        print("[-] error:", e, flush=True)
     finally:
-        hb.cancel()
         room = ROOMS.get(room_name) if room_name else None
         if room is not None and pid in room["peers"]:
             del room["peers"][pid]
@@ -101,15 +86,13 @@ async def handler(ws, path=None):
                     pass
             if not room["peers"]:
                 ROOMS.pop(room_name, None)
-                print("[-] Комната '%s' опустела и удалена" % room_name, flush=True)
-            else:
-                print("[-] id=%d вышел из '%s', комната жива" % (pid, room_name), flush=True)
+                print("[-] room '%s' removed" % room_name, flush=True)
 
 
 async def main():
     port = int(os.environ.get("PORT", 8080))
     async with websockets.serve(handler, "0.0.0.0", port, max_size=2 ** 22):
-        print("Реле запущено на порту %d" % port, flush=True)
+        print("relay on port %d" % port, flush=True)
         await asyncio.Future()
 
 
